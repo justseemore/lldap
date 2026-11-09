@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -61,13 +63,53 @@ func (l *LDAPClient) UserDN(userID string) string {
 }
 
 func (l *LDAPClient) dial(ctx context.Context) (*ldap.Conn, error) {
-	opts := []ldap.DialOpt{
-		ldap.DialWithTimeout(l.cfg.Timeout),
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
-	if l.cfg.TLSConfig != nil {
+
+	u, err := url.Parse(l.cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"lldap: parse ldap url %q: %w",
+			l.cfg.URL,
+			err,
+		)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf(
+			"lldap: ldap url %q has no host",
+			l.cfg.URL,
+		)
+	}
+
+	dialTimeout := l.cfg.Timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < dialTimeout {
+			dialTimeout = remaining
+		}
+	}
+	if dialTimeout <= 0 {
+		return nil, context.DeadlineExceeded
+	}
+
+	opts := []ldap.DialOpt{
+		ldap.DialWithDialer(&net.Dialer{Timeout: dialTimeout}),
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "ldap":
+		// plain connection; StartTLS is handled below.
+	case "ldaps":
 		opts = append(
 			opts,
-			ldap.DialWithTLSConfig(l.cfg.TLSConfig),
+			ldap.DialWithTLSConfig(l.tlsConfig(u.Hostname())),
+		)
+	default:
+		return nil, fmt.Errorf(
+			"lldap: unsupported ldap scheme %q",
+			u.Scheme,
 		)
 	}
 
@@ -81,13 +123,13 @@ func (l *LDAPClient) dial(ctx context.Context) (*ldap.Conn, error) {
 	}
 
 	if l.cfg.StartTLS {
-		if l.cfg.TLSConfig == nil {
+		if strings.ToLower(u.Scheme) != "ldap" {
 			conn.Close()
 			return nil, errors.New(
-				"lldap: StartTLS requires TLSConfig",
+				"lldap: StartTLS requires ldap:// scheme",
 			)
 		}
-		if err := conn.StartTLS(l.cfg.TLSConfig); err != nil {
+		if err := conn.StartTLS(l.tlsConfig(u.Hostname())); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf(
 				"lldap: starttls: %w",
@@ -97,11 +139,27 @@ func (l *LDAPClient) dial(ctx context.Context) (*ldap.Conn, error) {
 	}
 
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			conn.Close()
+			return nil, context.DeadlineExceeded
+		}
+		conn.SetTimeout(timeout)
 	} else {
-		_ = conn.SetTimeout(l.cfg.Timeout)
+		conn.SetTimeout(l.cfg.Timeout)
 	}
 	return conn, nil
+}
+
+func (l *LDAPClient) tlsConfig(serverName string) *tls.Config {
+	if l.cfg.TLSConfig == nil {
+		return &tls.Config{ServerName: serverName}
+	}
+	cfg := l.cfg.TLSConfig.Clone()
+	if cfg.ServerName == "" {
+		cfg.ServerName = serverName
+	}
+	return cfg
 }
 
 // Authenticate 用用户 DN 直接 bind。
